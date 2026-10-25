@@ -227,9 +227,13 @@ impl App {
     }
 
     fn pct(&self, i: usize) -> Option<f64> {
-        let svc = if self.daemon { self.svc.get(&self.inv.controls[i].id).map(|(d, _)| *d) } else { None };
+        let svc = if self.daemon { self.svc.get(&self.inv.controls[i].id) } else { None };
+        // A manual value shows as set, not as the fan's duty while it ramps there.
+        if let Some((d, true)) = svc {
+            return Some(*d);
+        }
         // Hubs do not report a duty: the service's, or the one set from here.
-        self.inv.pct(i).or(svc).or_else(|| self.set.get(&i).copied())
+        self.inv.pct(i).or(svc.map(|(d, _)| *d)).or_else(|| self.set.get(&i).copied())
     }
 
     fn say(&mut self, s: String, c: Color) {

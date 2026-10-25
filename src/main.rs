@@ -296,7 +296,12 @@ fn status(inv: &Inv) {
             continue;
         }
         let id = &inv.controls[i].id;
-        let pct = inv.pct(i).map(|p| format!("{p:.0}%")).or_else(|| svc.get(id).map(|(d, _)| format!("{:.0}%", d.parse::<f64>().unwrap_or(0.0)))).unwrap_or_else(|| "-".into());
+        let from_svc = |(d, _): &(String, bool)| format!("{:.0}%", d.parse::<f64>().unwrap_or(0.0));
+        // A manual value shows as set; otherwise what the hardware reports, or the service's duty.
+        let pct = match svc.get(id) {
+            Some(e @ (_, true)) => from_svc(e),
+            e => inv.pct(i).map(|p| format!("{p:.0}%")).or_else(|| e.map(from_svc)).unwrap_or_else(|| "-".into()),
+        };
         let mode = match svc.get(id) {
             Some((_, true)) => "manual".to_string(),
             Some((_, false)) => "curve".to_string(),
@@ -355,15 +360,15 @@ fn identify(inv: &Inv, i: usize) -> i32 {
 pub const STATE: &str = "/run/fanctl.duty";
 
 /// `<control> <duty>` per line, `manual` after the ones held from `fanctl set` or the live view.
-fn publish(inv: &Inv, curves: &[(&Vec<usize>, f64)], held: &std::collections::HashMap<usize, f64>, critical: bool) {
+fn publish(inv: &Inv, curves: &[(&Vec<usize>, f64)], held: &std::collections::HashMap<String, f64>, critical: bool) {
     let mut s = String::new();
     for (ids, duty) in curves {
-        for &i in ids.iter().filter(|i| !held.contains_key(i)) {
+        for &i in ids.iter().filter(|&&i| !held.contains_key(&inv.controls[i].id)) {
             s += &format!("{} {duty:.1}\n", inv.controls[i].id);
         }
     }
-    for (&i, &d) in held {
-        s += &format!("{} {:.1} manual\n", inv.controls[i].id, if critical { 100.0 } else { d });
+    for (id, &d) in held {
+        s += &format!("{id} {:.1} manual\n", if critical { 100.0 } else { d });
     }
     let tmp = format!("{STATE}.tmp");
     if std::fs::write(&tmp, s).is_ok() {
@@ -374,29 +379,34 @@ fn publish(inv: &Inv, curves: &[(&Vec<usize>, f64)], held: &std::collections::Ha
 /// Manual duties survive a restart and a reboot here, until `auto`.
 const MANUAL: &str = "/var/lib/fanctl/manual";
 
-fn load_manual(inv: &Inv) -> std::collections::HashMap<usize, f64> {
+fn load_manual() -> std::collections::HashMap<String, f64> {
     std::fs::read_to_string(MANUAL)
         .unwrap_or_default()
         .lines()
         .filter_map(|l| {
             let (id, d) = l.split_once(' ')?;
-            let d: f64 = d.trim().parse().ok()?;
-            let i = inv.controls.iter().position(|c| c.id == id)?;
-            Some((i, d.clamp(0.0, 100.0)))
+            Some((id.to_string(), d.trim().parse::<f64>().ok()?.clamp(0.0, 100.0)))
         })
         .collect()
 }
 
-fn save_manual(inv: &Inv, held: &std::collections::HashMap<usize, f64>) {
+fn save_manual(held: &std::collections::HashMap<String, f64>) {
     let mut s = String::new();
-    for (&i, d) in held {
-        s += &format!("{} {d:.0}\n", inv.controls[i].id);
+    for (id, d) in held {
+        s += &format!("{id} {d:.0}\n");
     }
     let _ = std::fs::create_dir_all("/var/lib/fanctl");
     let tmp = format!("{MANUAL}.tmp");
     if std::fs::write(&tmp, s).is_ok() {
         let _ = std::fs::rename(&tmp, MANUAL);
     }
+}
+
+/// The control with this id: in the main inventory, or among the GPU fans, which the service
+/// loads (NVML) only once one of them is held.
+fn find<'a>(inv: &'a Inv, gpu: &'a Option<Inv>, id: &str) -> Option<(&'a Inv, usize)> {
+    let at = |v: &'a Inv| v.controls.iter().position(|c| c.id == id).map(|i| (v, i));
+    at(inv).or_else(|| gpu.as_ref().and_then(at))
 }
 
 /// `fanctl set` / `auto` while the service runs: it owns the fans, so it makes the change.
@@ -467,12 +477,17 @@ fn run(inv: &Inv, path: &str) -> i32 {
         .collect();
     // Manual duties from `fanctl set` / the live view: the curves leave these controls alone
     // until `auto`. Critical still wins.
-    let mut held: std::collections::HashMap<usize, f64> = load_manual(inv);
+    let mut held = load_manual();
     if !held.is_empty() {
         println!("manual from {MANUAL}: {} controls", held.len());
     }
+    let mut gpu: Option<Inv> = if !inv.gpus.is_empty() || !held.keys().any(|k| k.starts_with("nvidia")) {
+        None
+    } else {
+        Some(Inv::scan_with(true, false))
+    };
     let mut held_changed = false;
-    let mut held_written: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+    let mut held_written: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     let sock = ctl::listen();
     let in_curve: Vec<usize> = live.iter().flat_map(|l| l.controls.iter().copied()).collect();
     let tick = Duration::from_millis(cfg.interval_ms.max(200));
@@ -495,27 +510,33 @@ fn run(inv: &Inv, path: &str) -> i32 {
                     [c, s, ..] => (*c, *s),
                     _ => return "error usage: set <control> <pct> | auto <control>".into(),
                 };
-                let ids = inv.select(spec);
+                let mut ids: Vec<String> = inv.select(spec).into_iter().map(|i| inv.controls[i].id.clone()).collect();
+                if ids.is_empty() && spec.starts_with("nvidia") && inv.gpus.is_empty() {
+                    let g = gpu.get_or_insert_with(|| Inv::scan_with(true, false));
+                    ids = g.select(spec).into_iter().map(|i| g.controls[i].id.clone()).collect();
+                }
                 if ids.is_empty() {
                     return format!("error no control '{spec}'");
                 }
                 match (cmd, w.get(2).map(|p| p.trim_end_matches('%').parse::<f64>())) {
                     ("set", Some(Ok(p))) => {
                         let p = p.clamp(0.0, 100.0);
-                        for &i in &ids {
-                            held.insert(i, p);
-                            held_written.remove(&i);
+                        for id in &ids {
+                            held.insert(id.clone(), p);
+                            held_written.remove(id);
                         }
                         held_changed = true;
                         format!("ok {} at {p:.0}%", ids.len())
                     }
                     ("auto", None) => {
-                        for &i in &ids {
-                            held.remove(&i);
-                            held_written.remove(&i);
+                        for id in &ids {
+                            held.remove(id);
+                            held_written.remove(id);
                             // Not in a curve: back to the hardware's own control.
-                            if !in_curve.contains(&i) {
-                                let _ = inv.auto(i);
+                            if let Some((v, i)) = find(inv, &gpu, id) {
+                                if !(std::ptr::eq(v, inv) && in_curve.contains(&i)) {
+                                    let _ = v.auto(i);
+                                }
                             }
                         }
                         // The curves write their duty again on this tick.
@@ -528,18 +549,20 @@ fn run(inv: &Inv, path: &str) -> i32 {
             });
         }
         if held_changed {
-            save_manual(inv, &held);
+            save_manual(&held);
             held_changed = false;
         }
         // Hubs forget a manual duty on a USB reset or after suspend: say it again every 30 s.
         let refresh = last_write.elapsed() > Duration::from_secs(30);
-        for (&i, &d) in &held {
+        for (id, &d) in &held {
             let want = if critical { 100.0 } else { d };
-            if refresh || held_written.get(&i) != Some(&want) {
-                if let Err(e) = inv.set(i, want) {
-                    eprintln!("{}: {e}", inv.controls[i].id);
+            if refresh || held_written.get(id) != Some(&want) {
+                match find(inv, &gpu, id).map(|(v, i)| v.set(i, want)) {
+                    Some(Err(e)) => eprintln!("{id}: {e}"),
+                    None => eprintln!("{id}: not found"),
+                    Some(Ok(())) => {}
                 }
-                held_written.insert(i, want);
+                held_written.insert(id.clone(), want);
             }
         }
         for (k, l) in live.iter_mut().enumerate() {
@@ -552,7 +575,7 @@ fn run(inv: &Inv, path: &str) -> i32 {
             let want = if critical { 100.0 } else { l.duty };
             let changed = written[k].map_or(true, |w| (w - want).abs() >= 1.0);
             if changed || refresh {
-                for &i in l.controls.iter().filter(|i| !held.contains_key(i)) {
+                for &i in l.controls.iter().filter(|&&i| !held.contains_key(&inv.controls[i].id)) {
                     if let Err(e) = inv.set(i, want) {
                         eprintln!("{}: {e}", inv.controls[i].id);
                     }
@@ -569,8 +592,14 @@ fn run(inv: &Inv, path: &str) -> i32 {
     let _ = std::fs::remove_file(STATE);
     let _ = std::fs::remove_file(ctl::SOCK);
     println!("stopping: curve and manual controls to {:.0}%", cfg.fail_pct);
-    for i in in_curve.iter().chain(held.keys()) {
-        let _ = inv.set(*i, cfg.fail_pct);
+    for &i in &in_curve {
+        let _ = inv.set(i, cfg.fail_pct);
+    }
+    for id in held.keys() {
+        if let Some((v, i)) = find(inv, &gpu, id) {
+            // A GPU's own driver curve is safe and would otherwise stay overridden.
+            let _ = if matches!(v.controls[i].kind, Kind::Gpu { .. }) { v.auto(i) } else { v.set(i, cfg.fail_pct) };
+        }
     }
     0
 }
