@@ -154,10 +154,10 @@ impl App {
             Row { name: "CPU CCD2".into(), t: self.label_temp(Some("k10temp"), "Tccd2"), lo: 30.0, hi: 95.0 },
             Row { name: "Coolant".into(), t: coolant, lo: 25.0, hi: 50.0 },
             Row { name: "GPU".into(), t: gpu.or_else(|| self.label_temp(Some("amdgpu"), "edge")), lo: 30.0, hi: 90.0 },
-            Row { name: "GPU memory".into(), t: self.label_temp(Some("vram"), "VRAM"), lo: 30.0, hi: 100.0 },
+            Row { name: "GPU VRAM".into(), t: self.label_temp(Some("vram"), "VRAM"), lo: 30.0, hi: 100.0 },
             Row { name: "VRM".into(), t: self.label_temp(None, "VRM"), lo: 30.0, hi: 110.0 },
-            Row { name: "NVMe (hottest)".into(), t: self.chip_max("nvme"), lo: 25.0, hi: 80.0 },
-            Row { name: "RAM (hottest)".into(), t: self.chip_max("spd5118").or_else(|| self.chip_max("jc42")), lo: 25.0, hi: 85.0 },
+            Row { name: "SSD".into(), t: self.chip_max("nvme"), lo: 25.0, hi: 80.0 },
+            Row { name: "System RAM".into(), t: self.chip_max("spd5118").or_else(|| self.chip_max("jc42")), lo: 25.0, hi: 85.0 },
         ];
         rows.retain(|r| r.t.is_some());
         self.rows = rows;
