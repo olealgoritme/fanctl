@@ -13,17 +13,17 @@ use std::time::{Duration, Instant};
 const USAGE: &str = "fanctl: find and control every fan, pump and temperature sensor
 
 usage:
-  fanctl                       live view (on a terminal; `sudo fanctl` to change fans)
+  fanctl                       live view (on a terminal)
   fanctl probe                 everything found: controllers, fans, pumps, sensors
   fanctl status                temperatures and every fan control, one line each
-  fanctl set <control> <pct>   fixed duty (control id, 'chip/*' or 'all')
-  fanctl auto <control>        give the control back to its hardware
+  fanctl set <control> <pct>   fixed duty, kept until auto (control id, 'chip/*' or 'all')
+  fanctl auto <control>        back to its curve, or to its hardware's own control
   fanctl identify <control>    100 % then 30 % for a few seconds each, to find which fan it is
   fanctl run [config]          curve daemon (default /etc/fanctl.toml)
 
 Control ids look like nct6799/pwm2, x53/pwm1, lianli/fan3, nvidia0/fan0.
 Sensor ids look like k10temp/temp1 or k10temp/Tctl (chip/label), vram/temp (NVIDIA VRAM, root).
-Writing needs root.";
+Changing fans needs root, or the sudo/wheel group while the service runs.";
 
 enum Kind {
     Pwm(hwmon::Pwm),
@@ -166,13 +166,15 @@ impl Inv {
 
     fn mode(&self, i: usize) -> String {
         match &self.controls[i].kind {
+            // Without the service: the hardware's own control (auto), or a value set directly.
             Kind::Pwm(p) => match p.mode() {
                 Some(0) => "full".into(),
-                Some(1) => "manual".into(),
-                Some(m) => format!("auto({m})"),
+                Some(1) => "fixed".into(),
+                Some(_) => "auto".into(),
                 None => "-".into(),
             },
-            _ => "-".into(),
+            Kind::Hub { .. } => "hub".into(),
+            Kind::Gpu { .. } => "auto".into(),
         }
     }
 
@@ -295,8 +297,12 @@ fn status(inv: &Inv) {
         }
         let id = &inv.controls[i].id;
         let pct = inv.pct(i).map(|p| format!("{p:.0}%")).or_else(|| svc.get(id).map(|(d, _)| format!("{:.0}%", d.parse::<f64>().unwrap_or(0.0)))).unwrap_or_else(|| "-".into());
-        let manual = if svc.get(id).map_or(false, |(_, m)| *m) { "  manual" } else { "" };
-        println!("{:<18} {:>8} {:>6}  {}{manual}", id, f0(rpm, " rpm"), pct, inv.controls[i].what);
+        let mode = match svc.get(id) {
+            Some((_, true)) => "manual".to_string(),
+            Some((_, false)) => "curve".to_string(),
+            None => inv.mode(i),
+        };
+        println!("{:<18} {:>8} {:>6}  {:<7} {}", id, f0(rpm, " rpm"), pct, mode, inv.controls[i].what);
     }
 }
 

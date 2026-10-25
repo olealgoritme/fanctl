@@ -236,6 +236,24 @@ impl App {
         self.note = Some((s, c, Instant::now()));
     }
 
+    /// Who sets this fan now, and the colour to show it in.
+    fn mode(&self, i: usize) -> (&'static str, Color) {
+        if let (true, Some((_, manual))) = (self.daemon, self.svc.get(&self.inv.controls[i].id)) {
+            return if *manual { ("manual", AMBER) } else { ("curve", GREEN) };
+        }
+        match &self.inv.controls[i].kind {
+            Kind::Pwm(p) => match p.mode() {
+                Some(0) => ("full", DIM),
+                Some(1) => ("fixed", DIM),
+                _ => ("auto", DIM),
+            },
+            Kind::Hub { .. } if self.set.contains_key(&i) => ("fixed", DIM),
+            Kind::Hub { .. } => ("hub", DIM),
+            Kind::Gpu { .. } if self.set.contains_key(&i) => ("fixed", DIM),
+            Kind::Gpu { .. } => ("auto", DIM),
+        }
+    }
+
     fn held(&self, i: usize) -> bool {
         self.daemon && self.svc.get(&self.inv.controls[i].id).map_or(false, |(_, m)| *m)
     }
@@ -465,12 +483,13 @@ fn fans(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let v = app.visible();
-    // id 18 + rpm 11 + percent 5 always; the device column (up to 34) and the bar share the rest.
-    let rest = (inner.width as usize).saturating_sub(18 + 11 + 5);
+    // id 18 + rpm 11 + mode 8 + percent 5 always; the device column (up to 34) and the bar
+    // share the rest.
+    let rest = (inner.width as usize).saturating_sub(18 + 11 + 8 + 5);
     let dw = if rest >= 34 + 12 { 34 } else if rest >= 24 { rest - 12 } else { 0 };
     let bw = (rest - if dw > 0 { dw + 1 } else { 0 }).clamp(4, 30) as u16;
     let mut lines = vec![Line::from(Span::styled(
-        format!(" {:<16}{} {:>9}  {:<w$}", "control", if dw > 0 { format!(" {:<dw$}", "device") } else { String::new() }, "rpm", "duty", w = bw as usize),
+        format!(" {:<16}{} {:>9}  {:<7} {:<w$}", "control", if dw > 0 { format!(" {:<dw$}", "device") } else { String::new() }, "rpm", "mode", "duty", w = bw as usize),
         Style::new().fg(DIM),
     ))];
     for (row, &i) in v.iter().enumerate() {
@@ -495,6 +514,8 @@ fn fans(f: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(FG).bg(bg),
             ),
         ];
+        let (mode, mc) = app.mode(i);
+        s.push(Span::styled(format!("{mode:<7} "), Style::new().fg(mc).bg(bg)));
         s.extend(bar(bw, pct.unwrap_or(0.0) / 100.0, &COOL));
         s.push(Span::styled(
             format!(" {:>4}", pct.map(|p| format!("{p:.0}%")).unwrap_or_else(|| "-".into())),
@@ -502,8 +523,6 @@ fn fans(f: &mut Frame, app: &App, area: Rect) {
         ));
         if app.identify.map(|(x, _, _)| x) == Some(i) {
             s.push(Span::styled("  ◌ identify", Style::new().fg(CYAN).bg(bg)));
-        } else if app.held(i) {
-            s.push(Span::styled("  manual", Style::new().fg(AMBER).bg(bg)));
         }
         lines.push(Line::from(s));
     }
