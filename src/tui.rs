@@ -100,6 +100,9 @@ struct App {
     rpms: Vec<Option<[u32; 4]>>,
     cpu: VecDeque<u64>,
     cool: VecDeque<u64>,
+    gpu: VecDeque<u64>,
+    has_cool: bool,
+    has_gpu: bool,
     /// Duties fanctl set from here, for hub channels that do not report theirs.
     set: HashMap<usize, f64>,
     daemon: bool,
@@ -164,8 +167,12 @@ impl App {
             h.push_back(v.unwrap_or(0.0).max(0.0) as u64);
         };
         let cpu = self.rows.first().and_then(|r| r.t);
+        let gpu_t = self.rows.iter().find(|r| r.name == "GPU").and_then(|r| r.t);
+        self.has_cool = coolant.is_some();
+        self.has_gpu = gpu_t.is_some();
         push(&mut self.cpu, cpu);
         push(&mut self.cool, coolant);
+        push(&mut self.gpu, gpu_t);
         if self.tick % 4 == 0 {
             self.daemon = daemon_active();
         }
@@ -351,8 +358,15 @@ fn temps(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn history(f: &mut Frame, app: &App, area: Rect) {
-    let [a, b] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
-    for (rect, title, data, accent, lo, hi) in [(a, "CPU", &app.cpu, AMBER, 30.0, 100.0), (b, "Coolant", &app.cool, CYAN, 20.0, 50.0)] {
+    // CPU always; next to it the coolant, or the GPU on a machine without a liquid cooler.
+    let mut charts = vec![("CPU", &app.cpu, AMBER, 30.0, 100.0)];
+    if app.has_cool {
+        charts.push(("Coolant", &app.cool, CYAN, 20.0, 50.0));
+    } else if app.has_gpu {
+        charts.push(("GPU", &app.gpu, VIOLET, 30.0, 90.0));
+    }
+    let rects = Layout::horizontal(vec![Constraint::Ratio(1, charts.len() as u32); charts.len()]).split(area);
+    for ((title, data, accent, lo, hi), &rect) in charts.into_iter().zip(rects.iter()) {
         let last = data.back().copied().unwrap_or(0) as f64;
         let t = format!("{title}  {last:.0} °C");
         let n = data.len();
@@ -514,6 +528,9 @@ pub fn run(inv: Inv) -> std::io::Result<()> {
         rpms: Vec::new(),
         cpu: VecDeque::with_capacity(HIST),
         cool: VecDeque::with_capacity(HIST),
+        gpu: VecDeque::with_capacity(HIST),
+        has_cool: false,
+        has_gpu: false,
         set: HashMap::new(),
         daemon: daemon_active(),
         root: unsafe { libc::geteuid() } == 0,
@@ -559,6 +576,9 @@ mod tests {
             rpms: Vec::new(),
             cpu: VecDeque::new(),
             cool: VecDeque::new(),
+            gpu: VecDeque::new(),
+            has_cool: false,
+            has_gpu: false,
             set: HashMap::new(),
             daemon: daemon_active(),
             root: false,
