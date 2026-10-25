@@ -109,8 +109,8 @@ struct App {
     root: bool,
     note: Option<(String, Color, Instant)>,
     identify: Option<(usize, Instant, f64)>,
-    /// Duties the service published (super::STATE).
-    svc: HashMap<String, f64>,
+    /// Duties the service published (super::STATE), and whether each is a manual one.
+    svc: HashMap<String, (f64, bool)>,
     tick: u64,
 }
 
@@ -196,21 +196,26 @@ impl App {
             .unwrap_or_default()
             .lines()
             .filter_map(|l| {
-                let (id, d) = l.rsplit_once(' ')?;
-                Some((id.to_string(), d.parse().ok()?))
+                let mut w = l.split_whitespace();
+                let id = w.next()?.to_string();
+                let d = w.next()?.parse().ok()?;
+                Some((id, (d, w.next() == Some("manual"))))
             })
             .collect();
         // identify: 4 s at 100 %, 4 s at 30 %, then back.
         if let Some((i, t0, back)) = self.identify {
             let s = t0.elapsed().as_secs_f64();
             if s >= 8.0 {
-                let _ = self.inv.set(i, back);
-                self.set.insert(i, back);
                 self.identify = None;
-                self.say(format!("{}: back to {back:.0}%", self.inv.controls[i].id), GREEN);
+                // A fan the curves ran goes back to them; a manual one to its value.
+                let r = if back < 0.0 { self.auto(i) } else { self.write(i, back) };
+                let id = self.inv.controls[i].id.clone();
+                match r {
+                    Ok(()) => self.say(format!("{id}: back"), GREEN),
+                    Err(e) => self.say(format!("{id}: {e}"), RED),
+                }
             } else if s >= 4.0 && self.set.get(&i) != Some(&30.0) {
-                let _ = self.inv.set(i, 30.0);
-                self.set.insert(i, 30.0);
+                let _ = self.write(i, 30.0);
             }
         }
     }
@@ -222,23 +227,62 @@ impl App {
     }
 
     fn pct(&self, i: usize) -> Option<f64> {
-        self.inv.pct(i).or_else(|| self.set.get(&i).copied()).or_else(|| if self.daemon { self.svc.get(&self.inv.controls[i].id).copied() } else { None })
+        let svc = if self.daemon { self.svc.get(&self.inv.controls[i].id).map(|(d, _)| *d) } else { None };
+        // Hubs do not report a duty: the service's, or the one set from here.
+        self.inv.pct(i).or(svc).or_else(|| self.set.get(&i).copied())
     }
 
     fn say(&mut self, s: String, c: Color) {
         self.note = Some((s, c, Instant::now()));
     }
 
+    fn held(&self, i: usize) -> bool {
+        self.daemon && self.svc.get(&self.inv.controls[i].id).map_or(false, |(_, m)| *m)
+    }
+
+    /// Who makes a change: the service while it runs (it owns the fans; its socket lets the
+    /// admin group in without sudo), otherwise this process if it is root.
     fn may_write(&mut self) -> bool {
+        if self.daemon && super::ctl::reachable() {
+            return true;
+        }
+        if self.daemon {
+            self.say("no access to the service: start fanctl with sudo".into(), AMBER);
+            return false;
+        }
         if !self.root {
             self.say("read-only: start fanctl with sudo to change fans".into(), AMBER);
             return false;
         }
-        if self.daemon {
-            self.say("the fanctl service sets these fans: press d to pause it first".into(), AMBER);
-            return false;
-        }
         true
+    }
+
+    fn write(&mut self, i: usize, pct: f64) -> Result<(), String> {
+        let id = self.inv.controls[i].id.clone();
+        if self.daemon {
+            super::ctl::send(&format!("set {id} {pct:.0}"))?;
+        } else {
+            self.inv.set(i, pct)?;
+        }
+        self.set.insert(i, pct);
+        if let Some(e) = self.svc.get_mut(&id) {
+            *e = (pct, true);
+        }
+        Ok(())
+    }
+
+    fn auto(&mut self, i: usize) -> Result<(), String> {
+        let id = self.inv.controls[i].id.clone();
+        if self.daemon {
+            super::ctl::send(&format!("auto {id}"))?;
+        } else {
+            self.inv.auto(i)?;
+        }
+        self.set.remove(&i);
+        if let Some(e) = self.svc.get_mut(&id) {
+            e.1 = false;
+        }
+        Ok(())
     }
 
     fn set_sel(&mut self, pct: f64) {
@@ -248,12 +292,11 @@ impl App {
             return;
         }
         let pct = pct.clamp(0.0, 100.0);
-        match self.inv.set(i, pct) {
-            Ok(()) => {
-                self.set.insert(i, pct);
-                self.say(format!("{} → {pct:.0}%", self.inv.controls[i].id), GREEN);
-            }
-            Err(e) => self.say(format!("{}: {e}", self.inv.controls[i].id), RED),
+        let id = self.inv.controls[i].id.clone();
+        match self.write(i, pct) {
+            Ok(()) if self.daemon => self.say(format!("{id} → {pct:.0}%, kept until a (auto)"), GREEN),
+            Ok(()) => self.say(format!("{id} → {pct:.0}%"), GREEN),
+            Err(e) => self.say(format!("{id}: {e}"), RED),
         }
     }
 
@@ -274,12 +317,11 @@ impl App {
                 let v = self.visible();
                 if let Some(&i) = v.get(self.sel) {
                     if self.may_write() {
-                        match self.inv.auto(i) {
-                            Ok(()) => {
-                                self.set.remove(&i);
-                                self.say(format!("{}: back to its hardware's control", self.inv.controls[i].id), GREEN);
-                            }
-                            Err(e) => self.say(format!("{}: {e}", self.inv.controls[i].id), RED),
+                        let id = self.inv.controls[i].id.clone();
+                        let to = if self.daemon { "the curve" } else { "its hardware's control" };
+                        match self.auto(i) {
+                            Ok(()) => self.say(format!("{id}: back to {to}"), GREEN),
+                            Err(e) => self.say(format!("{id}: {e}"), RED),
                         }
                     }
                 }
@@ -287,9 +329,9 @@ impl App {
             KeyCode::Char('i') => {
                 let v = self.visible();
                 if let Some(&i) = v.get(self.sel) {
-                    if self.identify.is_none() && self.may_write() && self.inv.set(i, 100.0).is_ok() {
-                        let back = self.pct(i).unwrap_or(100.0);
-                        self.set.insert(i, 100.0);
+                    // back < 0: the curve had it, hand it back with auto afterwards.
+                    let back = if !self.daemon || self.held(i) { self.pct(i).unwrap_or(100.0) } else { -1.0 };
+                    if self.identify.is_none() && self.may_write() && self.write(i, 100.0).is_ok() {
                         self.identify = Some((i, Instant::now(), back));
                         self.say(format!("{}: 100% then 30% — listen / look", self.inv.controls[i].id), CYAN);
                     }
@@ -331,10 +373,14 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     let (ds, dc) = if app.daemon { ("● service: curves active", GREEN) } else { ("○ service: off", AMBER) };
     l.push(Span::styled("   ", Style::new()));
     l.push(Span::styled(ds, Style::new().fg(dc)));
-    l.push(Span::styled(
-        if app.root { "   root: can change fans" } else { "   read-only (sudo fanctl to change)" },
-        Style::new().fg(DIM),
-    ));
+    let access = if app.daemon && super::ctl::reachable() {
+        "   ←→ changes fans (kept until a)"
+    } else if app.root {
+        "   root: can change fans"
+    } else {
+        "   read-only (sudo fanctl to change)"
+    };
+    l.push(Span::styled(access, Style::new().fg(DIM)));
     let counts = format!(
         "   {} controls · {} sensors · {} USB hubs · {} GPUs",
         app.inv.controls.len(),
@@ -456,6 +502,8 @@ fn fans(f: &mut Frame, app: &App, area: Rect) {
         ));
         if app.identify.map(|(x, _, _)| x) == Some(i) {
             s.push(Span::styled("  ◌ identify", Style::new().fg(CYAN).bg(bg)));
+        } else if app.held(i) {
+            s.push(Span::styled("  manual", Style::new().fg(AMBER).bg(bg)));
         }
         lines.push(Line::from(s));
     }

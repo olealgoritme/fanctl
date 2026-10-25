@@ -1,4 +1,5 @@
 mod config;
+mod ctl;
 mod hwmon;
 mod lianli;
 mod nvml;
@@ -270,6 +271,15 @@ fn probe(inv: &Inv) {
 
 fn status(inv: &Inv) {
     let rpms = inv.hub_rpms();
+    // What the service gave the controls that do not report a duty (hub channels).
+    let svc: std::collections::HashMap<String, (String, bool)> = std::fs::read_to_string(STATE)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            Some((w.next()?.to_string(), (w.next()?.to_string(), w.next() == Some("manual"))))
+        })
+        .collect();
     let temps: Vec<String> = inv
         .sensors
         .iter()
@@ -283,7 +293,10 @@ fn status(inv: &Inv) {
         if matches!(inv.controls[i].kind, Kind::Pwm(_) | Kind::Hub { .. }) && rpm == Some(0.0) {
             continue;
         }
-        println!("{:<18} {:>8} {:>6}  {}", inv.controls[i].id, f0(rpm, " rpm"), f0(inv.pct(i), "%"), inv.controls[i].what);
+        let id = &inv.controls[i].id;
+        let pct = inv.pct(i).map(|p| format!("{p:.0}%")).or_else(|| svc.get(id).map(|(d, _)| format!("{:.0}%", d.parse::<f64>().unwrap_or(0.0)))).unwrap_or_else(|| "-".into());
+        let manual = if svc.get(id).map_or(false, |(_, m)| *m) { "  manual" } else { "" };
+        println!("{:<18} {:>8} {:>6}  {}{manual}", id, f0(rpm, " rpm"), pct, inv.controls[i].what);
     }
 }
 
@@ -335,16 +348,62 @@ fn identify(inv: &Inv, i: usize) -> i32 {
 /// channels, which do not report theirs.
 pub const STATE: &str = "/run/fanctl.duty";
 
-fn publish(inv: &Inv, curves: &[(&Vec<usize>, f64)]) {
+/// `<control> <duty>` per line, `manual` after the ones held from `fanctl set` or the live view.
+fn publish(inv: &Inv, curves: &[(&Vec<usize>, f64)], held: &std::collections::HashMap<usize, f64>, critical: bool) {
     let mut s = String::new();
     for (ids, duty) in curves {
-        for &i in ids.iter() {
+        for &i in ids.iter().filter(|i| !held.contains_key(i)) {
             s += &format!("{} {duty:.1}\n", inv.controls[i].id);
         }
+    }
+    for (&i, &d) in held {
+        s += &format!("{} {:.1} manual\n", inv.controls[i].id, if critical { 100.0 } else { d });
     }
     let tmp = format!("{STATE}.tmp");
     if std::fs::write(&tmp, s).is_ok() {
         let _ = std::fs::rename(&tmp, STATE);
+    }
+}
+
+/// Manual duties survive a restart and a reboot here, until `auto`.
+const MANUAL: &str = "/var/lib/fanctl/manual";
+
+fn load_manual(inv: &Inv) -> std::collections::HashMap<usize, f64> {
+    std::fs::read_to_string(MANUAL)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (id, d) = l.split_once(' ')?;
+            let d: f64 = d.trim().parse().ok()?;
+            let i = inv.controls.iter().position(|c| c.id == id)?;
+            Some((i, d.clamp(0.0, 100.0)))
+        })
+        .collect()
+}
+
+fn save_manual(inv: &Inv, held: &std::collections::HashMap<usize, f64>) {
+    let mut s = String::new();
+    for (&i, d) in held {
+        s += &format!("{} {d:.0}\n", inv.controls[i].id);
+    }
+    let _ = std::fs::create_dir_all("/var/lib/fanctl");
+    let tmp = format!("{MANUAL}.tmp");
+    if std::fs::write(&tmp, s).is_ok() {
+        let _ = std::fs::rename(&tmp, MANUAL);
+    }
+}
+
+/// `fanctl set` / `auto` while the service runs: it owns the fans, so it makes the change.
+fn via_service(cmd: &str) -> i32 {
+    match ctl::send(cmd) {
+        Ok(r) => {
+            println!("{r}");
+            0
+        }
+        Err(e) => {
+            eprintln!("fanctl: {e}");
+            1
+        }
     }
 }
 
@@ -400,6 +459,16 @@ fn run(inv: &Inv, path: &str) -> i32 {
             }
         })
         .collect();
+    // Manual duties from `fanctl set` / the live view: the curves leave these controls alone
+    // until `auto`. Critical still wins.
+    let mut held: std::collections::HashMap<usize, f64> = load_manual(inv);
+    if !held.is_empty() {
+        println!("manual from {MANUAL}: {} controls", held.len());
+    }
+    let mut held_changed = false;
+    let mut held_written: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+    let sock = ctl::listen();
+    let in_curve: Vec<usize> = live.iter().flat_map(|l| l.controls.iter().copied()).collect();
     let tick = Duration::from_millis(cfg.interval_ms.max(200));
     let mut last_write = Instant::now() - Duration::from_secs(3600);
     let mut written: Vec<Option<f64>> = vec![None; live.len()];
@@ -413,8 +482,60 @@ fn run(inv: &Inv, path: &str) -> i32 {
             println!("critical {}", if critical { "on: everything to 100%" } else { "off" });
             was_critical = critical;
         }
+        if let Some(l) = &sock {
+            ctl::serve(l, |line| {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                let (cmd, spec) = match w.as_slice() {
+                    [c, s, ..] => (*c, *s),
+                    _ => return "error usage: set <control> <pct> | auto <control>".into(),
+                };
+                let ids = inv.select(spec);
+                if ids.is_empty() {
+                    return format!("error no control '{spec}'");
+                }
+                match (cmd, w.get(2).map(|p| p.trim_end_matches('%').parse::<f64>())) {
+                    ("set", Some(Ok(p))) => {
+                        let p = p.clamp(0.0, 100.0);
+                        for &i in &ids {
+                            held.insert(i, p);
+                            held_written.remove(&i);
+                        }
+                        held_changed = true;
+                        format!("ok {} at {p:.0}%", ids.len())
+                    }
+                    ("auto", None) => {
+                        for &i in &ids {
+                            held.remove(&i);
+                            held_written.remove(&i);
+                            // Not in a curve: back to the hardware's own control.
+                            if !in_curve.contains(&i) {
+                                let _ = inv.auto(i);
+                            }
+                        }
+                        // The curves write their duty again on this tick.
+                        written.iter_mut().for_each(|w| *w = None);
+                        held_changed = true;
+                        format!("ok {} back to auto", ids.len())
+                    }
+                    _ => "error usage: set <control> <pct> | auto <control>".into(),
+                }
+            });
+        }
+        if held_changed {
+            save_manual(inv, &held);
+            held_changed = false;
+        }
         // Hubs forget a manual duty on a USB reset or after suspend: say it again every 30 s.
         let refresh = last_write.elapsed() > Duration::from_secs(30);
+        for (&i, &d) in &held {
+            let want = if critical { 100.0 } else { d };
+            if refresh || held_written.get(&i) != Some(&want) {
+                if let Err(e) = inv.set(i, want) {
+                    eprintln!("{}: {e}", inv.controls[i].id);
+                }
+                held_written.insert(i, want);
+            }
+        }
         for (k, l) in live.iter_mut().enumerate() {
             let t = l.sensors.iter().map(|s| inv.temp(s)).try_fold(f64::MIN, |m, t| t.map(|t| m.max(t)));
             let target = match t {
@@ -425,7 +546,7 @@ fn run(inv: &Inv, path: &str) -> i32 {
             let want = if critical { 100.0 } else { l.duty };
             let changed = written[k].map_or(true, |w| (w - want).abs() >= 1.0);
             if changed || refresh {
-                for &i in &l.controls {
+                for &i in l.controls.iter().filter(|i| !held.contains_key(i)) {
                     if let Err(e) = inv.set(i, want) {
                         eprintln!("{}: {e}", inv.controls[i].id);
                     }
@@ -433,18 +554,17 @@ fn run(inv: &Inv, path: &str) -> i32 {
                 written[k] = Some(want);
             }
         }
-        publish(inv, &live.iter().map(|l| (&l.controls, if was_critical { 100.0 } else { l.duty })).collect::<Vec<_>>());
+        publish(inv, &live.iter().map(|l| (&l.controls, if was_critical { 100.0 } else { l.duty })).collect::<Vec<_>>(), &held, was_critical);
         if refresh {
             last_write = Instant::now();
         }
         std::thread::sleep(tick);
     }
     let _ = std::fs::remove_file(STATE);
-    println!("stopping: curve controls to {:.0}%", cfg.fail_pct);
-    for l in &live {
-        for &i in &l.controls {
-            let _ = inv.set(i, cfg.fail_pct);
-        }
+    let _ = std::fs::remove_file(ctl::SOCK);
+    println!("stopping: curve and manual controls to {:.0}%", cfg.fail_pct);
+    for i in in_curve.iter().chain(held.keys()) {
+        let _ = inv.set(*i, cfg.fail_pct);
     }
     0
 }
@@ -480,6 +600,8 @@ fn main() {
             status(&inv);
             0
         }
+        ["set", spec, pct] if ctl::reachable() => via_service(&format!("set {spec} {pct}")),
+        ["auto", spec] if ctl::reachable() => via_service(&format!("auto {spec}")),
         ["set", spec, pct] => match pct.trim_end_matches('%').parse::<f64>() {
             Ok(p) => apply(&inv, &pick(&inv, spec), |i| inv.set(i, p)),
             Err(_) => {

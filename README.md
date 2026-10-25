@@ -15,10 +15,15 @@ sudo install -m 755 target/release/fanctl /usr/local/bin/
 
 ## Use
 
+In the live view, ←→ (or 1-9, f) change the selected fan right away. While the service runs,
+that fan keeps your value, also after a reboot, until you press `a`; the other fans stay on
+their curves. Members of the sudo/wheel group can do this without sudo.
+
 ```
-fanctl                       live view (sudo fanctl to change fans)
+fanctl                       live view
 fanctl probe                 list everything found
-fanctl set lianli/* 70       set fans to 70 %
+fanctl set lianli/* 70       set fans to 70 % (kept until auto)
+fanctl auto lianli/*         back to the curve
 fanctl identify lianli/fan2  find out which fan that is
 ```
 
