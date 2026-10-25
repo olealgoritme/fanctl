@@ -287,8 +287,10 @@ impl App {
             self.inv.set(i, pct)?;
         }
         self.set.insert(i, pct);
-        if let Some(e) = self.svc.get_mut(&id) {
-            *e = (pct, true);
+        // Show it as manual at its new value now, not a second later when the service has
+        // published it (a GPU fan on auto has no entry yet).
+        if self.daemon {
+            self.svc.insert(id, (pct, true));
         }
         Ok(())
     }
