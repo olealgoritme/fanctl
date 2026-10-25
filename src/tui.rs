@@ -156,9 +156,25 @@ impl App {
             Row { name: "GPU Core".into(), t: gpu.or_else(|| self.label_temp(Some("amdgpu"), "edge")), lo: 30.0, hi: 90.0 },
             Row { name: "GPU vRAM".into(), t: self.label_temp(Some("vram"), "VRAM"), lo: 30.0, hi: 100.0 },
             Row { name: "VRM".into(), t: self.label_temp(None, "VRM"), lo: 30.0, hi: 110.0 },
-            Row { name: "SSD".into(), t: self.chip_max("nvme"), lo: 25.0, hi: 80.0 },
             Row { name: "System RAM".into(), t: self.chip_max("spd5118").or_else(|| self.chip_max("jc42")), lo: 25.0, hi: 85.0 },
         ];
+        // One row per NVMe drive, numbered like the kernel's nvmeN, with its model.
+        let mut drives: Vec<(u32, Row)> = self
+            .inv
+            .chips
+            .iter()
+            .filter_map(|c| {
+                let dev = c.device.rsplit('/').next()?;
+                let n: u32 = dev.strip_prefix("nvme")?.parse().ok()?;
+                let model = std::fs::read_to_string(format!("/sys/class/nvme/{dev}/model")).unwrap_or_default();
+                let model = model.split_whitespace().filter(|w| *w != "SSD").collect::<Vec<_>>().join(" ");
+                let t = super::hwmon::read_num(&c.path.join("temp1_input")).map(|m| m / 1000.0);
+                Some((n, Row { name: format!("NVMe {} {model}", n + 1), t, lo: 25.0, hi: 80.0 }))
+            })
+            .collect();
+        drives.sort_by_key(|(n, _)| *n);
+        let at = rows.iter().position(|r| r.name == "System RAM").unwrap_or(rows.len());
+        rows.splice(at..at, drives.into_iter().map(|(_, r)| r));
         rows.retain(|r| r.t.is_some());
         self.rows = rows;
         let push = |h: &mut VecDeque<u64>, v: Option<f64>| {
@@ -341,7 +357,9 @@ fn temps(f: &mut Frame, app: &App, area: Rect) {
     let block = panel("Temperatures", AMBER);
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let bw = inner.width.saturating_sub(26).max(6);
+    // Name column as wide as the longest name (NVMe models), at most 32.
+    let nw = app.rows.iter().map(|r| r.name.chars().count()).max().unwrap_or(15).clamp(15, 32);
+    let bw = inner.width.saturating_sub(nw as u16 + 12).max(6);
     let lines: Vec<Line> = app
         .rows
         .iter()
@@ -349,7 +367,7 @@ fn temps(f: &mut Frame, app: &App, area: Rect) {
             let t = r.t.unwrap_or(0.0);
             let frac = (t - r.lo) / (r.hi - r.lo);
             let c = ramp(&HEAT, frac as f32);
-            let mut s = vec![Span::styled(format!(" {:<15}", r.name), Style::new().fg(DIM))];
+            let mut s = vec![Span::styled(format!(" {:<nw$} ", r.name), Style::new().fg(DIM))];
             s.extend(bar(bw, frac, &HEAT));
             s.push(Span::styled(format!(" {t:>5.1} °C", ), Style::new().fg(c).bold()));
             Line::from(s)
