@@ -13,6 +13,10 @@ binary: probe, fixed duties, and a curve daemon that starts at boot.
 
 ## Use
 
+`fanctl` on its own opens the live view: temperatures, every connected fan and pump, and keys
+to set a duty, hand a fan back to its hardware, find a fan, and pause or start the service
+(`sudo fanctl` to change anything).
+
 ```
 fanctl probe                 everything found
 fanctl status                temperatures and connected fans
@@ -22,7 +26,7 @@ fanctl identify lianli/fan2  100 % then 30 %, to find which fan it is
 fanctl run /etc/fanctl.toml  curve daemon
 ```
 
-Writing needs root. Build with `cargo build --release` (Rust 1.65 or newer).
+Writing needs root. Build with `cargo build --release` (Rust 1.74 or newer).
 
 ## Curves
 

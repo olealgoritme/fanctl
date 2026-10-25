@@ -2,6 +2,7 @@ mod config;
 mod hwmon;
 mod lianli;
 mod nvml;
+mod tui;
 mod usbscan;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant};
 const USAGE: &str = "fanctl: find and control every fan, pump and temperature sensor
 
 usage:
+  fanctl                       live view (on a terminal; `sudo fanctl` to change fans)
   fanctl probe                 everything found: controllers, fans, pumps, sensors
   fanctl status                temperatures and every fan control, one line each
   fanctl set <control> <pct>   fixed duty (control id, 'chip/*' or 'all')
@@ -307,6 +309,23 @@ fn identify(inv: &Inv, i: usize) -> i32 {
     0
 }
 
+/// Where `fanctl run` says which duty it gave each control: the live view shows it for hub
+/// channels, which do not report theirs.
+pub const STATE: &str = "/run/fanctl.duty";
+
+fn publish(inv: &Inv, curves: &[(&Vec<usize>, f64)]) {
+    let mut s = String::new();
+    for (ids, duty) in curves {
+        for &i in ids.iter() {
+            s += &format!("{} {duty:.1}\n", inv.controls[i].id);
+        }
+    }
+    let tmp = format!("{STATE}.tmp");
+    if std::fs::write(&tmp, s).is_ok() {
+        let _ = std::fs::rename(&tmp, STATE);
+    }
+}
+
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: libc::c_int) {
@@ -392,11 +411,13 @@ fn run(inv: &Inv, path: &str) -> i32 {
                 written[k] = Some(want);
             }
         }
+        publish(inv, &live.iter().map(|l| (&l.controls, if was_critical { 100.0 } else { l.duty })).collect::<Vec<_>>());
         if refresh {
             last_write = Instant::now();
         }
         std::thread::sleep(tick);
     }
+    let _ = std::fs::remove_file(STATE);
     println!("stopping: curve controls to {:.0}%", cfg.fail_pct);
     for l in &live {
         for &i in &l.controls {
@@ -417,6 +438,13 @@ fn main() {
             probe(&inv);
             0
         }
+        [] if unsafe { libc::isatty(1) } == 1 => match tui::run(inv) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("fanctl: {e}");
+                1
+            }
+        },
         ["status"] | [] => {
             status(&inv);
             0
