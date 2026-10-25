@@ -152,11 +152,11 @@ impl App {
             Row { name: "CPU (Tctl)".into(), t: self.label_temp(Some("k10temp"), "Tctl").or_else(|| self.label_temp(Some("coretemp"), "Package id 0")), lo: 30.0, hi: 95.0 },
             Row { name: "CPU CCD1".into(), t: self.label_temp(Some("k10temp"), "Tccd1"), lo: 30.0, hi: 95.0 },
             Row { name: "CPU CCD2".into(), t: self.label_temp(Some("k10temp"), "Tccd2"), lo: 30.0, hi: 95.0 },
-            Row { name: "Coolant".into(), t: coolant, lo: 25.0, hi: 50.0 },
+            Row { name: "System RAM".into(), t: self.chip_max("spd5118").or_else(|| self.chip_max("jc42")), lo: 25.0, hi: 85.0 },
+            Row { name: "CPU AIO Coolant".into(), t: coolant, lo: 25.0, hi: 50.0 },
             Row { name: "GPU Core".into(), t: gpu.or_else(|| self.label_temp(Some("amdgpu"), "edge")), lo: 30.0, hi: 90.0 },
             Row { name: "GPU vRAM".into(), t: self.label_temp(Some("vram"), "VRAM"), lo: 30.0, hi: 100.0 },
             Row { name: "VRM".into(), t: self.label_temp(None, "VRM"), lo: 30.0, hi: 110.0 },
-            Row { name: "System RAM".into(), t: self.chip_max("spd5118").or_else(|| self.chip_max("jc42")), lo: 25.0, hi: 85.0 },
         ];
         // One row per NVMe drive, numbered like the kernel's nvmeN, with its model.
         let mut drives: Vec<(u32, Row)> = self
@@ -173,8 +173,7 @@ impl App {
             })
             .collect();
         drives.sort_by_key(|(n, _)| *n);
-        let at = rows.iter().position(|r| r.name == "System RAM").unwrap_or(rows.len());
-        rows.splice(at..at, drives.into_iter().map(|(_, r)| r));
+        rows.extend(drives.into_iter().map(|(_, r)| r));
         rows.retain(|r| r.t.is_some());
         self.rows = rows;
         let push = |h: &mut VecDeque<u64>, v: Option<f64>| {
@@ -380,7 +379,7 @@ fn history(f: &mut Frame, app: &App, area: Rect) {
     // CPU always; next to it the coolant, or the GPU on a machine without a liquid cooler.
     let mut charts = vec![("CPU", &app.cpu, AMBER, 30.0, 100.0)];
     if app.has_cool {
-        charts.push(("Coolant", &app.cool, CYAN, 20.0, 50.0));
+        charts.push(("CPU AIO Coolant", &app.cool, CYAN, 20.0, 50.0));
     } else if app.has_gpu {
         charts.push(("GPU", &app.gpu, VIOLET, 30.0, 90.0));
     }
