@@ -319,6 +319,12 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
         app.inv.gpus.len()
     );
     l.push(Span::styled(counts, Style::new().fg(DIM)));
+    // Narrow terminal: keep the title and the service state, drop the rest.
+    let mut w = 0usize;
+    l.retain(|s| {
+        w += s.content.chars().count();
+        w <= area.width as usize
+    });
     f.render_widget(Paragraph::new(vec![Line::raw(""), Line::from(l)]).style(Style::new().bg(BG)), area);
 }
 
@@ -345,16 +351,17 @@ fn temps(f: &mut Frame, app: &App, area: Rect) {
 
 fn history(f: &mut Frame, app: &App, area: Rect) {
     let [a, b] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
-    for (rect, title, data, accent, max) in [(a, "CPU °C", &app.cpu, AMBER, 100), (b, "Coolant °C", &app.cool, CYAN, 55)] {
+    for (rect, title, data, accent, lo, max) in [(a, "CPU °C", &app.cpu, AMBER, 30, 100), (b, "Coolant °C", &app.cool, CYAN, 20, 50)] {
         let last = data.back().copied().unwrap_or(0);
         let t = format!("{title}  {last}");
         let block = panel(&t, accent);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         let w = inner.width as usize;
-        let v: Vec<u64> = data.iter().skip(data.len().saturating_sub(w)).copied().collect();
-        let c = ramp(&HEAT, last as f32 / max as f32);
-        f.render_widget(Sparkline::default().data(&v).max(max).style(Style::new().fg(c).bg(PANEL)), inner);
+        // Plotted from `lo` up, so a few degrees are visible.
+        let v: Vec<u64> = data.iter().skip(data.len().saturating_sub(w)).map(|t| t.saturating_sub(lo)).collect();
+        let c = ramp(&HEAT, (last.saturating_sub(lo)) as f32 / (max - lo) as f32);
+        f.render_widget(Sparkline::default().data(&v).max(max - lo).style(Style::new().fg(c).bg(PANEL)), inner);
     }
 }
 
@@ -364,9 +371,12 @@ fn fans(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let v = app.visible();
-    let bw = inner.width.saturating_sub(64).clamp(6, 30);
+    // id 18 + rpm 11 + percent 5 always; the device column (up to 34) and the bar share the rest.
+    let rest = (inner.width as usize).saturating_sub(18 + 11 + 5);
+    let dw = if rest >= 34 + 12 { 34 } else if rest >= 24 { rest - 12 } else { 0 };
+    let bw = (rest - if dw > 0 { dw + 1 } else { 0 }).clamp(4, 30) as u16;
     let mut lines = vec![Line::from(Span::styled(
-        format!(" {:<16} {:<34} {:>9}  {:<w$}  {:>5}", "control", "device", "rpm", "duty", "", w = bw as usize),
+        format!(" {:<16}{} {:>9}  {:<w$}", "control", if dw > 0 { format!(" {:<dw$}", "device") } else { String::new() }, "rpm", "duty", w = bw as usize),
         Style::new().fg(DIM),
     ))];
     for (row, &i) in v.iter().enumerate() {
@@ -376,7 +386,7 @@ fn fans(f: &mut Frame, app: &App, area: Rect) {
         let selected = row == app.sel;
         let bg = if selected { SEL } else { PANEL };
         let marker = if selected { "▸" } else { " " };
-        let what: String = c.what.chars().take(34).collect();
+        let what: String = c.what.chars().take(dw).collect();
         let icon = match c.kind {
             Kind::Gpu { .. } => "◈",
             Kind::Hub { .. } => "◎",
@@ -385,7 +395,7 @@ fn fans(f: &mut Frame, app: &App, area: Rect) {
         };
         let mut s = vec![
             Span::styled(format!("{marker}{icon} {:<14} ", c.id), Style::new().fg(if selected { CYAN } else { FG }).bg(bg).bold()),
-            Span::styled(format!("{what:<34} "), Style::new().fg(DIM).bg(bg)),
+            Span::styled(if dw > 0 { format!("{what:<dw$} ") } else { String::new() }, Style::new().fg(DIM).bg(bg)),
             Span::styled(
                 format!("{:>9}  ", rpm.map(|r| format!("{r:.0} rpm")).unwrap_or_else(|| "-".into())),
                 Style::new().fg(FG).bg(bg),
@@ -544,7 +554,8 @@ mod tests {
         for _ in 0..30 {
             app.refresh();
         }
-        let mut t = Terminal::new(TestBackend::new(150, 42)).unwrap();
+        let w: u16 = std::env::var("FANCTL_TEST_W").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
+        let mut t = Terminal::new(TestBackend::new(w, 42)).unwrap();
         t.draw(|f| draw(f, &app)).unwrap();
         let b = t.backend().buffer();
         for y in 0..b.area.height {

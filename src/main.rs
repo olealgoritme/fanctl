@@ -144,7 +144,7 @@ impl Inv {
         match &self.controls[i].kind {
             Kind::Pwm(p) => p.rpm(),
             Kind::Hub { hub, ch } => hub_rpms[*hub].map(|r| r[(*ch - 1) as usize] as f64),
-            Kind::Gpu { .. } => None,
+            Kind::Gpu { gpu, fan } => self.nvml.as_ref()?.fan_rpm(&self.gpus[*gpu], *fan),
         }
     }
 

@@ -84,6 +84,20 @@ impl Nvml {
         (unsafe { f(g.dev, fan, &mut s) } == NVML_SUCCESS).then_some(s as f64)
     }
 
+    /// RPM of one fan (nvmlDeviceGetFanSpeedRPM, drivers from 535 on).
+    pub fn fan_rpm(&self, g: &Gpu, fan: u32) -> Option<f64> {
+        #[repr(C)]
+        struct Info {
+            version: c_uint,
+            fan: c_uint,
+            speed: c_uint,
+        }
+        let f = self.sym::<unsafe extern "C" fn(Dev, *mut Info) -> c_int>(b"nvmlDeviceGetFanSpeedRPM")?;
+        // NVML_STRUCT_VERSION(FanSpeedInfo, 1)
+        let mut i = Info { version: std::mem::size_of::<Info>() as c_uint | 1 << 24, fan, speed: 0 };
+        (unsafe { f(g.dev, &mut i) } == NVML_SUCCESS).then_some(i.speed as f64)
+    }
+
     pub fn set_fan(&self, g: &Gpu, fan: u32, pct: f64) -> Result<(), String> {
         let f = self
             .sym::<unsafe extern "C" fn(Dev, c_uint, c_uint) -> c_int>(b"nvmlDeviceSetFanSpeed_v2")
