@@ -153,8 +153,8 @@ impl App {
             Row { name: "CPU CCD1".into(), t: self.label_temp(Some("k10temp"), "Tccd1"), lo: 30.0, hi: 95.0 },
             Row { name: "CPU CCD2".into(), t: self.label_temp(Some("k10temp"), "Tccd2"), lo: 30.0, hi: 95.0 },
             Row { name: "Coolant".into(), t: coolant, lo: 25.0, hi: 50.0 },
-            Row { name: "GPU".into(), t: gpu.or_else(|| self.label_temp(Some("amdgpu"), "edge")), lo: 30.0, hi: 90.0 },
-            Row { name: "GPU VRAM".into(), t: self.label_temp(Some("vram"), "VRAM"), lo: 30.0, hi: 100.0 },
+            Row { name: "GPU Core".into(), t: gpu.or_else(|| self.label_temp(Some("amdgpu"), "edge")), lo: 30.0, hi: 90.0 },
+            Row { name: "GPU vRAM".into(), t: self.label_temp(Some("vram"), "VRAM"), lo: 30.0, hi: 100.0 },
             Row { name: "VRM".into(), t: self.label_temp(None, "VRM"), lo: 30.0, hi: 110.0 },
             Row { name: "SSD".into(), t: self.chip_max("nvme"), lo: 25.0, hi: 80.0 },
             Row { name: "System RAM".into(), t: self.chip_max("spd5118").or_else(|| self.chip_max("jc42")), lo: 25.0, hi: 85.0 },
@@ -168,7 +168,7 @@ impl App {
             h.push_back(v.unwrap_or(0.0).max(0.0) as u64);
         };
         let cpu = self.rows.first().and_then(|r| r.t);
-        let gpu_t = self.rows.iter().find(|r| r.name == "GPU").and_then(|r| r.t);
+        let gpu_t = self.rows.iter().find(|r| r.name == "GPU Core").and_then(|r| r.t);
         self.has_cool = coolant.is_some();
         self.has_gpu = gpu_t.is_some();
         push(&mut self.cpu, cpu);
