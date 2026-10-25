@@ -1,0 +1,13 @@
+[Unit]
+Description=fanctl fan curves
+After=systemd-udev-settle.service
+
+[Service]
+ExecStart=/usr/local/bin/fanctl run /etc/fanctl.toml
+Restart=always
+RestartSec=2
+# On stop fanctl puts its fans to fail_pct (100 %) before it exits.
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

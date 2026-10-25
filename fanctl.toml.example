@@ -1,0 +1,30 @@
+# /etc/fanctl.toml for `fanctl run` (ids: see `fanctl probe`)
+interval_ms = 1000
+fail_pct = 100            # unreadable sensor, and on exit
+
+# Radiator fans follow the coolant: quiet at idle, full by 42 C.
+[[curve]]
+name = "radiator"
+controls = ["lianli/*"]
+sensors = ["x53/Coolant temp"]
+points = [[30, 30], [33, 40], [36, 60], [39, 80], [42, 100]]
+min_pct = 30
+down_per_s = 3
+
+# Pump: never below 60 %.
+[[curve]]
+name = "pump"
+controls = ["x53/pwm1"]
+sensors = ["x53/Coolant temp"]
+points = [[30, 60], [35, 80], [38, 100]]
+min_pct = 60
+down_per_s = 2
+
+# Everything in the curves above to 100 % while either holds.
+[[critical]]
+sensor = "k10temp/Tctl"
+above = 90
+
+[[critical]]
+sensor = "x53/Coolant temp"
+above = 42

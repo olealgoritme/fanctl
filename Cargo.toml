@@ -1,0 +1,18 @@
+[package]
+name = "fanctl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.65"
+authors = ["Ole Algoritme <olealgoritme@gmail.com>"]
+description = "Find and control every fan, pump and temperature sensor on Linux: hwmon (motherboards, GPUs, AIOs and hubs with kernel drivers), Lian Li Uni hubs over USB, NVIDIA GPUs over NVML"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+opt-level = 2
+strip = true
