@@ -92,6 +92,32 @@ struct Row {
     hi: f64,
 }
 
+/// (control, duty or None for auto, the service's answer)
+type Reply = (String, Option<f64>, Result<String, String>);
+
+struct Sender {
+    tx: std::sync::mpsc::Sender<(String, Option<f64>)>,
+    rx: std::sync::mpsc::Receiver<Reply>,
+    worker: std::thread::JoinHandle<()>,
+}
+
+impl Sender {
+    fn start() -> Sender {
+        let (tx, jobs) = std::sync::mpsc::channel::<(String, Option<f64>)>();
+        let (done, rx) = std::sync::mpsc::channel::<Reply>();
+        let worker = std::thread::spawn(move || {
+            for (id, pct) in jobs {
+                let r = match pct {
+                    Some(p) => super::ctl::send(&format!("set {id} {p:.0}")),
+                    None => super::ctl::send(&format!("auto {id}")),
+                };
+                let _ = done.send((id, pct, r));
+            }
+        });
+        Sender { tx, rx, worker }
+    }
+}
+
 struct App {
     inv: Inv,
     sel: usize,
@@ -111,6 +137,13 @@ struct App {
     identify: Option<(usize, Instant, f64)>,
     /// Duties the service published (super::STATE), and whether each is a manual one.
     svc: HashMap<String, (f64, bool)>,
+    /// Per control, read once a second: rpm, the duty the hardware reports, pwmN_enable.
+    hw: Vec<(Option<f64>, Option<f64>, Option<i64>)>,
+    /// A duty chosen with the keys, sent once they have been still for a moment.
+    pending: Option<(usize, f64, Instant)>,
+    /// Requests to the service go through one worker thread, in order, so the screen never
+    /// waits for one and the last value always arrives last.
+    sender: Option<Sender>,
     tick: u64,
 }
 
@@ -146,6 +179,15 @@ impl App {
 
     fn refresh(&mut self) {
         self.rpms = self.inv.hub_rpms();
+        self.hw = (0..self.inv.controls.len())
+            .map(|i| {
+                let mode = match &self.inv.controls[i].kind {
+                    Kind::Pwm(p) => p.mode(),
+                    _ => None,
+                };
+                (self.inv.rpm(i, &self.rpms), self.inv.pct(i), mode)
+            })
+            .collect();
         let gpu = self.inv.sensors.iter().find(|s| s.id.starts_with("nvidia")).and_then(|s| self.inv.temp(s));
         let coolant = self.label_temp(None, "Coolant temp").or_else(|| self.label_temp(None, "Coolant"));
         let mut rows = vec![
@@ -222,18 +264,27 @@ impl App {
 
     fn visible(&self) -> Vec<usize> {
         (0..self.inv.controls.len())
-            .filter(|&i| self.all || self.inv.rpm(i, &self.rpms) != Some(0.0))
+            .filter(|&i| self.all || self.rpm(i) != Some(0.0))
             .collect()
     }
 
+    fn rpm(&self, i: usize) -> Option<f64> {
+        self.hw.get(i).and_then(|h| h.0)
+    }
+
     fn pct(&self, i: usize) -> Option<f64> {
+        if let Some((p, d, _)) = self.pending {
+            if p == i {
+                return Some(d);
+            }
+        }
         let svc = if self.daemon { self.svc.get(&self.inv.controls[i].id) } else { None };
         // A manual value shows as set, not as the fan's duty while it ramps there.
         if let Some((d, true)) = svc {
             return Some(*d);
         }
         // Hubs do not report a duty: the service's, or the one set from here.
-        self.inv.pct(i).or(svc.map(|(d, _)| *d)).or_else(|| self.set.get(&i).copied())
+        self.hw.get(i).and_then(|h| h.1).or(svc.map(|(d, _)| *d)).or_else(|| self.set.get(&i).copied())
     }
 
     fn say(&mut self, s: String, c: Color) {
@@ -242,11 +293,14 @@ impl App {
 
     /// Who sets this fan now, and the colour to show it in.
     fn mode(&self, i: usize) -> (&'static str, Color) {
+        if self.pending.map(|(p, _, _)| p) == Some(i) {
+            return (if self.daemon { "manual" } else { "fixed" }, if self.daemon { AMBER } else { DIM });
+        }
         if let (true, Some((_, manual))) = (self.daemon, self.svc.get(&self.inv.controls[i].id)) {
             return if *manual { ("manual", AMBER) } else { ("curve", GREEN) };
         }
         match &self.inv.controls[i].kind {
-            Kind::Pwm(p) => match p.mode() {
+            Kind::Pwm(_) => match self.hw.get(i).and_then(|h| h.2) {
                 Some(0) => ("full", DIM),
                 Some(1) => ("fixed", DIM),
                 _ => ("auto", DIM),
@@ -279,10 +333,14 @@ impl App {
         true
     }
 
+    fn queue(&mut self, id: String, pct: Option<f64>) {
+        let _ = self.sender.get_or_insert_with(Sender::start).tx.send((id, pct));
+    }
+
     fn write(&mut self, i: usize, pct: f64) -> Result<(), String> {
         let id = self.inv.controls[i].id.clone();
         if self.daemon {
-            super::ctl::send(&format!("set {id} {pct:.0}"))?;
+            self.queue(id.clone(), Some(pct));
         } else {
             self.inv.set(i, pct)?;
         }
@@ -296,31 +354,80 @@ impl App {
     }
 
     fn auto(&mut self, i: usize) -> Result<(), String> {
+        // A value still waiting for the keys to settle is dropped: auto is the newer choice.
+        if self.pending.map(|(p, _, _)| p) == Some(i) {
+            self.pending = None;
+        }
         let id = self.inv.controls[i].id.clone();
         if self.daemon {
-            super::ctl::send(&format!("auto {id}"))?;
+            self.queue(id.clone(), None);
         } else {
             self.inv.auto(i)?;
         }
         self.set.remove(&i);
-        if let Some(e) = self.svc.get_mut(&id) {
+        // A GPU fan goes back to its driver, which the service does not list; a curve fan to
+        // the curve.
+        if matches!(self.inv.controls[i].kind, Kind::Gpu { .. }) {
+            self.svc.remove(&id);
+        } else if let Some(e) = self.svc.get_mut(&id) {
             e.1 = false;
         }
         Ok(())
     }
 
+    /// Keys change the shown duty at once; `flush` sends it when they have been still for 150 ms,
+    /// so a burst of presses is one change.
     fn set_sel(&mut self, pct: f64) {
         let v = self.visible();
         let Some(&i) = v.get(self.sel) else { return };
         if !self.may_write() {
             return;
         }
+        if let Some((p, _, _)) = self.pending {
+            if p != i {
+                self.flush(true);
+            }
+        }
         let pct = pct.clamp(0.0, 100.0);
+        self.pending = Some((i, pct, Instant::now()));
+        self.say(format!("{} → {pct:.0}%", self.inv.controls[i].id), CYAN);
+    }
+
+    fn flush(&mut self, now: bool) {
+        // Report the requests the service has answered.
+        let replies: Vec<Reply> = self.sender.as_ref().map(|s| s.rx.try_iter().collect()).unwrap_or_default();
+        for (id, pct, r) in replies {
+            match (r, pct) {
+                (Ok(_), Some(p)) => self.say(format!("{id} → {p:.0}%, kept until a (auto)"), GREEN),
+                (Ok(_), None) => self.say(format!("{id}: back to the curve"), GREEN),
+                (Err(e), _) => self.say(format!("{id}: {e}"), RED),
+            }
+        }
+        let Some((i, pct, t)) = self.pending else { return };
+        if !now && t.elapsed() < Duration::from_millis(150) {
+            return;
+        }
+        self.pending = None;
         let id = self.inv.controls[i].id.clone();
+        if self.daemon {
+            // Shown as manual at this value from now on; the service confirms it in the background.
+            self.set.insert(i, pct);
+            self.svc.insert(id.clone(), (pct, true));
+            self.queue(id, Some(pct));
+            return;
+        }
         match self.write(i, pct) {
-            Ok(()) if self.daemon => self.say(format!("{id} → {pct:.0}%, kept until a (auto)"), GREEN),
             Ok(()) => self.say(format!("{id} → {pct:.0}%"), GREEN),
             Err(e) => self.say(format!("{id}: {e}"), RED),
+        }
+    }
+
+    /// Quitting: the last value is sent, and every request has arrived, before the screen goes.
+    fn finish(&mut self) {
+        self.flush(true);
+        if let Some(Sender { tx, worker, .. }) = self.sender.take() {
+            drop(tx);
+            let _ = worker.join();
         }
     }
 
@@ -500,7 +607,7 @@ fn fans(f: &mut Frame, app: &App, area: Rect) {
     ))];
     for (row, &i) in v.iter().enumerate() {
         let c = &app.inv.controls[i];
-        let rpm = app.inv.rpm(i, &app.rpms);
+        let rpm = app.rpm(i);
         let pct = app.pct(i);
         let selected = row == app.sel;
         let bg = if selected { SEL } else { PANEL };
@@ -628,6 +735,9 @@ pub fn run(inv: Inv) -> std::io::Result<()> {
         note: None,
         identify: None,
         svc: HashMap::new(),
+        hw: Vec::new(),
+        pending: None,
+        sender: None,
         tick: 0,
     };
     app.refresh();
@@ -635,13 +745,15 @@ pub fn run(inv: Inv) -> std::io::Result<()> {
     loop {
         term.draw(|f| draw(f, &app))?;
         app.tick = app.tick.wrapping_add(1);
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press && !app.key(k.code, k.modifiers) {
+                    app.finish();
                     break;
                 }
             }
         }
+        app.flush(false);
         if last.elapsed() >= Duration::from_secs(1) {
             app.refresh();
             last = Instant::now();
@@ -676,6 +788,9 @@ mod tests {
             note: None,
             identify: None,
             svc: HashMap::new(),
+            hw: Vec::new(),
+            pending: None,
+            sender: None,
             tick: 0,
         };
         for _ in 0..30 {

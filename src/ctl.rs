@@ -49,6 +49,14 @@ pub fn serve(l: &UnixListener, mut handle: impl FnMut(&str) -> String) {
     }
 }
 
+/// Sleep until a request arrives on the socket or `max` has passed.
+pub fn wait(l: &UnixListener, max: Duration) {
+    use std::os::fd::AsRawFd;
+    let mut p = libc::pollfd { fd: l.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let ms = max.as_millis().min(i32::MAX as u128) as i32;
+    unsafe { libc::poll(&mut p, 1, ms) };
+}
+
 /// Whether this process may talk to the service.
 pub fn reachable() -> bool {
     let Ok(p) = std::ffi::CString::new(SOCK) else { return false };

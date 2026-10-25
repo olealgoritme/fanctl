@@ -503,55 +503,6 @@ fn run(inv: &Inv, path: &str) -> i32 {
             println!("critical {}", if critical { "on: everything to 100%" } else { "off" });
             was_critical = critical;
         }
-        if let Some(l) = &sock {
-            ctl::serve(l, |line| {
-                let w: Vec<&str> = line.split_whitespace().collect();
-                let (cmd, spec) = match w.as_slice() {
-                    [c, s, ..] => (*c, *s),
-                    _ => return "error usage: set <control> <pct> | auto <control>".into(),
-                };
-                let mut ids: Vec<String> = inv.select(spec).into_iter().map(|i| inv.controls[i].id.clone()).collect();
-                if ids.is_empty() && spec.starts_with("nvidia") && inv.gpus.is_empty() {
-                    let g = gpu.get_or_insert_with(|| Inv::scan_with(true, false));
-                    ids = g.select(spec).into_iter().map(|i| g.controls[i].id.clone()).collect();
-                }
-                if ids.is_empty() {
-                    return format!("error no control '{spec}'");
-                }
-                match (cmd, w.get(2).map(|p| p.trim_end_matches('%').parse::<f64>())) {
-                    ("set", Some(Ok(p))) => {
-                        let p = p.clamp(0.0, 100.0);
-                        for id in &ids {
-                            held.insert(id.clone(), p);
-                            held_written.remove(id);
-                        }
-                        held_changed = true;
-                        format!("ok {} at {p:.0}%", ids.len())
-                    }
-                    ("auto", None) => {
-                        for id in &ids {
-                            held.remove(id);
-                            held_written.remove(id);
-                            // Not in a curve: back to the hardware's own control.
-                            if let Some((v, i)) = find(inv, &gpu, id) {
-                                if !(std::ptr::eq(v, inv) && in_curve.contains(&i)) {
-                                    let _ = v.auto(i);
-                                }
-                            }
-                        }
-                        // The curves write their duty again on this tick.
-                        written.iter_mut().for_each(|w| *w = None);
-                        held_changed = true;
-                        format!("ok {} back to auto", ids.len())
-                    }
-                    _ => "error usage: set <control> <pct> | auto <control>".into(),
-                }
-            });
-        }
-        if held_changed {
-            save_manual(&held);
-            held_changed = false;
-        }
         // Hubs forget a manual duty on a USB reset or after suspend: say it again every 30 s.
         let refresh = last_write.elapsed() > Duration::from_secs(30);
         for (id, &d) in &held {
@@ -587,7 +538,75 @@ fn run(inv: &Inv, path: &str) -> i32 {
         if refresh {
             last_write = Instant::now();
         }
-        std::thread::sleep(tick);
+        // Until the next tick: answer the socket as soon as a request comes, and apply it at once.
+        let until = Instant::now() + tick;
+        while Instant::now() < until && !STOP.load(Ordering::SeqCst) {
+            if let Some(l) = &sock {
+                ctl::serve(l, |line| {
+                    let w: Vec<&str> = line.split_whitespace().collect();
+                    let (cmd, spec) = match w.as_slice() {
+                        [c, s, ..] => (*c, *s),
+                        _ => return "error usage: set <control> <pct> | auto <control>".into(),
+                    };
+                    let mut ids: Vec<String> = inv.select(spec).into_iter().map(|i| inv.controls[i].id.clone()).collect();
+                    if ids.is_empty() && spec.starts_with("nvidia") && inv.gpus.is_empty() {
+                        let g = gpu.get_or_insert_with(|| Inv::scan_with(true, false));
+                        ids = g.select(spec).into_iter().map(|i| g.controls[i].id.clone()).collect();
+                    }
+                    if ids.is_empty() {
+                        return format!("error no control '{spec}'");
+                    }
+                    match (cmd, w.get(2).map(|p| p.trim_end_matches('%').parse::<f64>())) {
+                        ("set", Some(Ok(p))) => {
+                            let p = p.clamp(0.0, 100.0);
+                            for id in &ids {
+                                held.insert(id.clone(), p);
+                                held_written.remove(id);
+                            }
+                            held_changed = true;
+                            format!("ok {} at {p:.0}%", ids.len())
+                        }
+                        ("auto", None) => {
+                            for id in &ids {
+                                held.remove(id);
+                                held_written.remove(id);
+                                // Not in a curve: back to the hardware's own control.
+                                if let Some((v, i)) = find(inv, &gpu, id) {
+                                    if !(std::ptr::eq(v, inv) && in_curve.contains(&i)) {
+                                        let _ = v.auto(i);
+                                    }
+                                }
+                            }
+                            // The curves write their duty again on this tick.
+                            written.iter_mut().for_each(|w| *w = None);
+                            held_changed = true;
+                            format!("ok {} back to auto", ids.len())
+                        }
+                        _ => "error usage: set <control> <pct> | auto <control>".into(),
+                    }
+                });
+            }
+            if held_changed {
+                save_manual(&held);
+                held_changed = false;
+                for (id, &d) in &held {
+                    let want = if critical { 100.0 } else { d };
+                    if held_written.get(id) != Some(&want) {
+                        if let Some(Err(e)) = find(inv, &gpu, id).map(|(v, i)| v.set(i, want)) {
+                            eprintln!("{id}: {e}");
+                        }
+                        held_written.insert(id.clone(), want);
+                    }
+                }
+                publish(inv, &live.iter().map(|l| (&l.controls, if was_critical { 100.0 } else { l.duty })).collect::<Vec<_>>(), &held, was_critical);
+            }
+            // Wake for the next request at once; otherwise at the next tick.
+            let left = until.saturating_duration_since(Instant::now());
+            match &sock {
+                Some(l) => ctl::wait(l, left),
+                None => std::thread::sleep(left),
+            }
+        }
     }
     let _ = std::fs::remove_file(STATE);
     let _ = std::fs::remove_file(ctl::SOCK);

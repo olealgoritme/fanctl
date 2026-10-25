@@ -35,6 +35,9 @@ pub struct Hub {
     pub name: &'static str,
     pub node: PathBuf,
     kind: Kind,
+    /// Channels told to stop following the PWM input, and when: the mode command is sent again
+    /// only after 30 s (a USB reset or suspend forgets it), so a duty change is one write.
+    fixed: std::cell::Cell<(u8, Option<std::time::Instant>)>,
 }
 
 pub const CHANNELS: u8 = 4;
@@ -71,6 +74,7 @@ pub fn hubs() -> Vec<Hub> {
                 name,
                 node: PathBuf::from("/dev").join(n),
                 kind,
+                fixed: std::cell::Cell::new((0, None)),
             }
         })
         .collect()
@@ -89,9 +93,11 @@ impl Hub {
         OpenOptions::new().read(true).write(write).open(&self.node)
     }
 
+    /// The hub drops a command that follows the previous one too closely; 20 ms is enough
+    /// (tested on an SL-Infinity: four channels in 88 ms, every one at its duty).
     fn send(f: &mut File, b: &[u8]) -> std::io::Result<()> {
         f.write_all(b)?;
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(20));
         Ok(())
     }
 
@@ -134,13 +140,22 @@ impl Hub {
     /// Channel `ch` (1-4) to a fixed duty: stop following the PWM input, then the speed.
     pub fn set(&self, ch: u8, pct: f64) -> std::io::Result<()> {
         let mut f = self.open(true)?;
-        Self::send(&mut f, &[224, 16, self.pwm_cmd(), 0x10 << (ch - 1)])?;
+        let bit = 1u8 << (ch - 1);
+        let (mask, at) = self.fixed.get();
+        let fresh = at.map_or(false, |t| t.elapsed() < std::time::Duration::from_secs(30));
+        if mask & bit == 0 || !fresh {
+            Self::send(&mut f, &[224, 16, self.pwm_cmd(), 0x10 << (ch - 1)])?;
+            let mask = if fresh { mask | bit } else { bit };
+            self.fixed.set((mask, Some(at.filter(|_| fresh).unwrap_or_else(std::time::Instant::now))));
+        }
         Self::send(&mut f, &[224, ch + 31, 0, self.speed_byte(pct)])
     }
 
     /// Channel `ch` follows the hub's motherboard PWM input again.
     pub fn auto(&self, ch: u8) -> std::io::Result<()> {
         let mut f = self.open(true)?;
+        let (mask, at) = self.fixed.get();
+        self.fixed.set((mask & !(1 << (ch - 1)), at));
         Self::send(&mut f, &[224, 16, self.pwm_cmd(), 0x11 << (ch - 1)])
     }
 }
@@ -158,7 +173,7 @@ mod tests {
 
     #[test]
     fn speed_bytes_match_liquidctl() {
-        let h = |kind| Hub { id: String::new(), name: "", node: PathBuf::new(), kind };
+        let h = |kind| Hub { id: String::new(), name: "", node: PathBuf::new(), kind, fixed: std::cell::Cell::new((0, None)) };
         assert_eq!(h(Kind::Sli).speed_byte(100.0), 100);
         assert_eq!(h(Kind::Sli).speed_byte(0.0), 10);
         assert_eq!(h(Kind::Sl).speed_byte(100.0), 100);
