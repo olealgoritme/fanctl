@@ -552,7 +552,7 @@ mod tests {
     #[ignore]
     fn render() {
         let mut app = App {
-            inv: Inv::scan(),
+            inv: Inv::scan_with(true),
             sel: 0,
             all: false,
             rows: Vec::new(),

@@ -56,10 +56,11 @@ struct Inv {
 }
 
 impl Inv {
-    fn scan() -> Inv {
+    /// `gpus`: load NVML (it maps the NVIDIA driver library and opens the GPU).
+    fn scan_with(gpus: bool) -> Inv {
         let chips = hwmon::chips();
         let hubs = lianli::hubs();
-        let nvml = nvml::Nvml::load();
+        let nvml = if gpus { nvml::Nvml::load() } else { None };
         let gpus = nvml.as_ref().map(|n| n.gpus()).unwrap_or_default();
         let mut controls = Vec::new();
         let mut sensors = Vec::new();
@@ -432,7 +433,15 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    let inv = Inv::scan();
+    // The service needs NVML only when its config names a GPU.
+    let gpus = match a.as_slice() {
+        ["run"] | ["run", _] => {
+            let path = a.get(1).copied().unwrap_or("/etc/fanctl.toml");
+            std::fs::read_to_string(path).map_or(true, |c| c.contains("nvidia"))
+        }
+        _ => true,
+    };
+    let inv = Inv::scan_with(gpus);
     let rc = match a.as_slice() {
         ["probe"] => {
             probe(&inv);
