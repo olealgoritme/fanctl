@@ -4,7 +4,7 @@ See and control every fan, pump and temperature sensor on Linux.
 
 - Motherboard fans, AMD GPUs, and USB coolers with a kernel driver (NZXT, Corsair, Aquacomputer, ...)
 - Lian Li Uni fan hubs over USB
-- NVIDIA GPU fans
+- NVIDIA GPU fans, and NVIDIA VRAM temperature (RTX 3000/4000 GDDR6/6X, RTX 5090 GDDR7 per module; root)
 
 ## Install
 
@@ -37,4 +37,5 @@ If a sensor can't be read, or the service stops, all its fans go to 100 %.
 Made by Ole Algoritme. MIT license.
 
 Lian Li protocol from [liquidctl](https://github.com/liquidctl/liquidctl) and
-[uni-sync](https://github.com/EightB1ts/uni-sync).
+[uni-sync](https://github.com/EightB1ts/uni-sync). VRAM registers from
+[gddr6](https://github.com/olealgoritme/gddr6) and [gpuwatch](https://github.com/olealgoritme/gpuwatch).

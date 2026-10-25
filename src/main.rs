@@ -4,6 +4,7 @@ mod lianli;
 mod nvml;
 mod tui;
 mod usbscan;
+mod vram;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ usage:
   fanctl run [config]          curve daemon (default /etc/fanctl.toml)
 
 Control ids look like nct6799/pwm2, x53/pwm1, lianli/fan3, nvidia0/fan0.
-Sensor ids look like k10temp/temp1 or k10temp/Tctl (chip/label).
+Sensor ids look like k10temp/temp1 or k10temp/Tctl (chip/label), vram/temp (NVIDIA VRAM, root).
 Writing needs root.";
 
 enum Kind {
@@ -38,6 +39,8 @@ struct Control {
 enum Src {
     File(std::path::PathBuf),
     Gpu(usize),
+    /// VRAM of GPU n: the hottest module, or one module.
+    Vram(usize, Option<u32>),
 }
 
 struct Sensor {
@@ -51,16 +54,19 @@ struct Inv {
     hubs: Vec<lianli::Hub>,
     nvml: Option<nvml::Nvml>,
     gpus: Vec<nvml::Gpu>,
+    vram: Vec<vram::Gpu>,
     controls: Vec<Control>,
     sensors: Vec<Sensor>,
 }
 
 impl Inv {
-    /// `gpus`: load NVML (it maps the NVIDIA driver library and opens the GPU).
-    fn scan_with(gpus: bool) -> Inv {
+    /// `gpus`: load NVML (it maps the NVIDIA driver library and opens the GPU). `vram`: map the
+    /// BAR0 of supported NVIDIA GPUs for their memory temperature (root only).
+    fn scan_with(gpus: bool, vram: bool) -> Inv {
         let chips = hwmon::chips();
         let hubs = lianli::hubs();
         let nvml = if gpus { nvml::Nvml::load() } else { None };
+        let vram = if vram && unsafe { libc::geteuid() } == 0 { vram::gpus() } else { Vec::new() };
         let gpus = nvml.as_ref().map(|n| n.gpus()).unwrap_or_default();
         let mut controls = Vec::new();
         let mut sensors = Vec::new();
@@ -92,13 +98,21 @@ impl Inv {
                 });
             }
         }
-        Inv { chips, hubs, nvml, gpus, controls, sensors }
+        for (i, v) in vram.iter().enumerate() {
+            sensors.push(Sensor { id: format!("{}/temp", v.id), label: Some("VRAM".into()), src: Src::Vram(i, None) });
+            for (m, _) in v.modules() {
+                sensors.push(Sensor { id: format!("{}/module{m}", v.id), label: Some(format!("VRAM module {m}")), src: Src::Vram(i, Some(m)) });
+            }
+        }
+        Inv { chips, hubs, nvml, gpus, vram, controls, sensors }
     }
 
     fn temp(&self, s: &Sensor) -> Option<f64> {
         match &s.src {
             Src::File(p) => hwmon::read_num(p).map(|m| m / 1000.0),
             Src::Gpu(i) => self.nvml.as_ref()?.temp(&self.gpus[*i]),
+            Src::Vram(i, None) => self.vram[*i].hottest(),
+            Src::Vram(i, Some(m)) => self.vram[*i].module(*m),
         }
     }
 
@@ -209,6 +223,13 @@ fn probe(inv: &Inv) {
         None => println!("  NVML not available"),
         Some(_) if inv.gpus.is_empty() => println!("  none"),
         Some(_) => inv.gpus.iter().for_each(|g| println!("  {:<18} {}, {} fans", g.id, g.name, g.fans)),
+    }
+    println!("\n== GPU memory (VRAM registers, root)");
+    if inv.vram.is_empty() {
+        println!("  none{}", if unsafe { libc::geteuid() } == 0 { "" } else { " (run as root)" });
+    }
+    for v in &inv.vram {
+        println!("  {:<18} {}, {} modules", v.id, v.name, v.modules().len());
     }
     let unreached = usbscan::unreached(|v, p| v == 0x0cf2 && inv.hubs.iter().any(|_| (0xa100..=0xa105).contains(&p) || p == 0x7750));
     println!("\n== USB devices from cooling vendors nothing here controls");
@@ -433,15 +454,16 @@ fn main() {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
-    // The service needs NVML only when its config names a GPU.
-    let gpus = match a.as_slice() {
+    // The service touches the GPU (NVML, VRAM registers) only when its config names it.
+    let (gpus, vram) = match a.as_slice() {
         ["run"] | ["run", _] => {
             let path = a.get(1).copied().unwrap_or("/etc/fanctl.toml");
-            std::fs::read_to_string(path).map_or(true, |c| c.contains("nvidia"))
+            let c = std::fs::read_to_string(path).unwrap_or_default();
+            (c.contains("nvidia"), c.contains("vram"))
         }
-        _ => true,
+        _ => (true, true),
     };
-    let inv = Inv::scan_with(gpus);
+    let inv = Inv::scan_with(gpus, vram);
     let rc = match a.as_slice() {
         ["probe"] => {
             probe(&inv);
