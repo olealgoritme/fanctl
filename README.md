@@ -35,7 +35,8 @@ sudo cp fanctl.service /etc/systemd/system/
 sudo systemctl enable --now fanctl
 ```
 
-If a sensor can't be read, or the service stops, all its fans go to 100 %.
+If a sensor can't be read, or the service stops, all its fans go to 100 %. A cooler whose
+driver loads after the service is picked up on its own.
 
 ## Credits
 

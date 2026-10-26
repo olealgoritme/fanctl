@@ -425,11 +425,26 @@ fn via_service(cmd: &str) -> i32 {
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
+/// `run` returns this when hardware it was missing has appeared: scan again and start over.
+const RESCAN: i32 = -1;
+
+/// How many of the config's controls and sensors this scan has.
+fn found(inv: &Inv, cfg: &config::Config) -> usize {
+    let curves = cfg.curve.iter().map(|c| {
+        c.controls.iter().filter(|s| !inv.select(s).is_empty()).count() + c.sensors.iter().filter(|s| inv.sensor(s).is_some()).count()
+    });
+    curves.sum::<usize>() + cfg.critical.iter().filter(|c| inv.sensor(&c.sensor).is_some()).count()
+}
+
+fn wanted(cfg: &config::Config) -> usize {
+    cfg.curve.iter().map(|c| c.controls.len() + c.sensors.len()).sum::<usize>() + cfg.critical.len()
+}
+
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
-fn run(inv: &Inv, path: &str) -> i32 {
+fn run(inv: &Inv, path: &str, gpus: bool, vram: bool) -> i32 {
     let cfg = match config::Config::load(path) {
         Ok(c) => c,
         Err(e) => {
@@ -495,9 +510,25 @@ fn run(inv: &Inv, path: &str) -> i32 {
     let mut written: Vec<Option<f64>> = vec![None; live.len()];
     let mut was_critical = false;
     let mut prev = Instant::now();
+    // A driver that loads after the service (a USB cooler at boot) is picked up by scanning
+    // again while something is missing: every 5 s for two minutes, then every minute.
+    let have = found(inv, &cfg);
+    let missing = have < wanted(&cfg);
+    let started = Instant::now();
+    let mut last_scan = Instant::now();
     while !STOP.load(Ordering::SeqCst) {
         let dt = prev.elapsed().as_secs_f64();
         prev = Instant::now();
+        let every = if started.elapsed() < Duration::from_secs(120) { 5 } else { 60 };
+        if missing && last_scan.elapsed() >= Duration::from_secs(every) {
+            last_scan = Instant::now();
+            if found(&Inv::scan_with(gpus, vram), &cfg) > have {
+                println!("new hardware: scanning again");
+                save_manual(&held);
+                let _ = std::fs::remove_file(ctl::SOCK);
+                return RESCAN;
+            }
+        }
         let critical = crit.iter().any(|(s, above)| inv.temp(s).map_or(true, |t| t > *above));
         if critical != was_critical {
             println!("critical {}", if critical { "on: everything to 100%" } else { "off" });
@@ -668,8 +699,16 @@ fn main() {
             let v = pick(&inv, spec);
             v.iter().map(|&i| identify(&inv, i)).max().unwrap_or(0)
         }
-        ["run"] => run(&inv, "/etc/fanctl.toml"),
-        ["run", path] => run(&inv, path),
+        ["run"] | ["run", _] => {
+            let path = a.get(1).copied().unwrap_or("/etc/fanctl.toml");
+            let mut inv = inv;
+            loop {
+                match run(&inv, path, gpus, vram) {
+                    RESCAN => inv = Inv::scan_with(gpus, vram),
+                    rc => break rc,
+                }
+            }
+        }
         _ => {
             println!("{USAGE}");
             if matches!(a.as_slice(), ["-h"] | ["--help"] | ["help"]) { 0 } else { 2 }
